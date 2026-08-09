@@ -1,0 +1,120 @@
+# @zakkster/lite-worker-pool
+
+> Zero-GC data-parallel worker pool built on @zakkster/lite-worker. Bind one
+> worker body ONCE, `map` an array across every core, and get results back in
+> input order with nothing allocating in the per-item dispatch loop. Zero
+> dependencies, single file, full TypeScript types. Where lite-worker gives you
+> one off-thread core with a clean main thread, lite-worker-pool gives you N of
+> them behind a single `map(items) -> Promise<results>` call. v1.0.0 is the
+> initial release: index-ordered map, a saturating job queue, and a per-worker
+> transferable scratch buffer ping-ponged in/out so steady-state dispatch is
+> allocation-free.
+
+## Mental model
+
+One transform, bound once, running on N workers. `createWorkerPool(workerFn)`
+serializes `workerFn` (the per-item transform `(item) => result`) into every
+worker -- there is NO per-`map` worker function. `pool.map(items)` hands the
+items to a job queue: each worker pulls the next unassigned index the instant it
+finishes its current one, so no worker idles while work remains. Results are
+written into a preallocated array BY INDEX -- output order === input order no
+matter what order the workers finish in.
+
+Each worker owns ONE transferable scratch ArrayBuffer, allocated once at pool
+construction, that ping-pongs main<->worker via ownership transfer (like
+lite-worker's frame pool). The main side writes `[index, value]` into the two
+Float64 slots, transfers the buffer to the worker; the worker applies the
+transform to the value slot and transfers the same buffer back; the main side
+files the result under `index` and immediately re-uses that buffer for the next
+queued item. The dispatch loop reuses a single transfer list, so per-item
+dispatch allocates nothing. `map()` itself allocates the results array + one
+Promise per batch (cold, once) -- that is the only per-batch cost.
+
+## Core API
+
+- `VERSION: string` -- the package version constant (currently `"1.0.0"`), kept in
+  three-place sync with package.json and CHANGELOG.md. Named export from WorkerPool.js.
+- `createWorkerPool(workerFn, opts?) -> Pool` (also the default export)
+  - `workerFn(item) -> result` is `.toString()`-serialized into every worker. It
+    MUST be self-contained: it cannot close over module scope and cannot use bare
+    `import` -- it crosses a thread boundary.
+  - `opts`:
+    - `size?` -- worker count. Fail-closed: a missing/NaN/negative/zero value floors
+      to `navigator.hardwareConcurrency`, then to 1. Never 0.
+    - `scratchBytes?` -- per-worker scratch byte length. Floors to 16 (two Float64
+      slots: index + value).
+    - `name?` -- pool name for worker naming. Default `"lite-worker-pool"`.
+    - `spawn?` -- injectable worker factory `(spec) => PoolWorker`. Defaults to a
+      real lite-worker over a Blob URL. Inject it to run the pool over a
+      node:worker_threads bridge (or any transport) -- this is what makes the pool
+      testable without a browser, mirroring lite-worker's `frameChannel(transport)`.
+      `spec` is `{ workerFn, index, name, scratchBytes }`; the returned `PoolWorker`
+      is `{ send(buf, transfer?), onRaw(fn) -> off, onError(fn) -> off, terminate() }`.
+      `onError` is REQUIRED and load-bearing: the pool subscribes to it so a worker
+      throw or death fails the batch closed instead of hanging. An injected factory
+      that omits `onError` reintroduces that hang -- wire it (forward the transport's
+      uncaught-error / thread `error` events). The default factory wires it for you.
+      Unknown `opts` keys throw with a did-you-mean hint (fail closed on misconfig).
+- `Pool`:
+  - `map(items) -> Promise<results[]>` -- dispatch every item; results are filled by
+    index (input order preserved). One batch at a time: a second concurrent `map`
+    rejects. An empty array resolves to `[]`. Fails closed -- the returned promise
+    REJECTS if the pool is disposed, if `items` is null / not array-like, or if a
+    worker throws or dies mid-batch. A worker error also POISONS the pool (its
+    scratch buffer went down with the worker, so reuse is unsafe): every later
+    `map()` rejects until you `dispose()` and recreate. A thrown transform is
+    deterministic, so the batch is rejected with that error rather than retried.
+  - `stats() -> { size, queued, active, done }` -- cold progress snapshot. `queued`
+    is items not yet assigned (0 when idle), `active` is jobs in flight, `done` is
+    replies filed in the current/last batch.
+  - `size` -- the resolved worker count.
+  - `dispose()` -- idempotent full teardown: terminate every worker, drop handlers,
+    reject an in-flight batch. A second call is a no-op and never throws.
+
+## Ownership: the ping-pong
+
+`send(buf)` transfers, so the buffer detaches on the sender and re-materializes at
+the receiver as a fresh ArrayBuffer identity (the memory is moved, not copied).
+The pool holds exactly one buffer per worker; a buffer always comes to rest back
+at its worker when the queue drains, so the buffer count is conserved at exactly
+`size`. The only per-hop cost is one Float64 view header over the returned buffer
+(transient, GC'd) -- there is no retained per-item allocation, which is what the
+`< 8 B/op` retention gate proves.
+
+## Constraints
+
+- Self-contained transform: no capture of surrounding scope, no bare `import`.
+  Everything the worker needs must be inside `workerFn` or passed as the item value.
+- Numeric items: the scratch protocol moves items and results as Float64 values in
+  the two scratch slots. Pack richer payloads yourself if you extend the protocol.
+- One batch at a time: await a `map` before starting the next.
+- Fail closed: a missing/NaN/negative worker count floors to >=1, never 0; a
+  disposed pool rejects rather than silently no-ops; a worker throw/death rejects
+  the batch and poisons the pool (dispose + recreate to continue) rather than
+  hanging or dropping the item; unknown `opts` keys throw.
+- Peer dependency on `@zakkster/lite-worker` (the default factory builds workers via
+  `defineWorker`). Inject `opts.spawn` to run over another transport.
+
+## Do / don't
+
+- DO keep `workerFn` pure and self-contained -- it is serialized across the boundary.
+- DO inject `opts.spawn` to run the pool over node:worker_threads (or a mock) in tests.
+- DO await one `map` before starting the next; check `stats()` for progress.
+- DON'T reference outer variables inside `workerFn` -- serialization drops them.
+- DON'T reuse an `items` buffer during a `map` -- the pool reads from it as it dispatches.
+- DON'T rely on a worker count of 0 -- it floors to 1 by design.
+
+## Files
+
+- WorkerPool.js -- single-file ESM source (exports `createWorkerPool`, `VERSION`, default export).
+- WorkerPool.d.ts -- full strict TypeScript declarations.
+- test/torture.mjs -- the torture suite: T0 conservation (10k items over a real
+  node:worker_threads bridge), T1 ordering (out-of-order completion), T2 saturation
+  (no starved worker, queue drains), T3 worker-error (a throwing transform makes
+  `map()` REJECT within a bounded wait -- proves it fails closed, never hangs),
+  T6 retention (< 8 B/op over 10k dispatch hops + create/dispose leak check),
+  T9 controls (conservation/ordering/retention/worker-error gates each proven able
+  to fail). Prints exactly `ok`, exit 0. `npm run torture`.
+- bench/gc-gate.mjs -- fast release retention gate via @zakkster/lite-gc-profiler. `npm run gate`.
+
+License: MIT (c) Zahary Shinikchiev

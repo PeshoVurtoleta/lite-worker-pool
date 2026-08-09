@@ -1,0 +1,79 @@
+{
+  "name": "@zakkster/lite-worker-pool",
+  "version": "1.0.0",
+  "description": "Zero-GC data-parallel worker pool over @zakkster/lite-worker. Bind one worker body, map an array across every core with an index-ordered result, nothing allocating in the per-item dispatch loop. Zero dependencies, single file.",
+  "type": "module",
+  "main": "./WorkerPool.js",
+  "module": "./WorkerPool.js",
+  "types": "./WorkerPool.d.ts",
+  "exports": {
+    ".": {
+      "types": "./WorkerPool.d.ts",
+      "node": "./WorkerPool.js",
+      "import": "./WorkerPool.js",
+      "default": "./WorkerPool.js"
+    }
+  },
+  "files": [
+    "WorkerPool.js",
+    "WorkerPool.d.ts",
+    "llms.txt",
+    "CHANGELOG.md",
+    "README.md"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "test": "node --test test/WorkerPool.test.js",
+    "check": "node --check WorkerPool.js && tsc --noEmit --strict WorkerPool.d.ts",
+    "gate": "node --expose-gc bench/gc-gate.mjs",
+    "torture": "node --expose-gc test/torture.mjs",
+    "soak": "node --expose-gc test/torture.mjs"
+  },
+  "keywords": [
+    "worker",
+    "worker-pool",
+    "thread-pool",
+    "web-worker",
+    "parallel",
+    "data-parallel",
+    "map",
+    "job-queue",
+    "work-stealing",
+    "transferable",
+    "zero-gc",
+    "multicore",
+    "hardwareconcurrency",
+    "inline-worker",
+    "blob-worker",
+    "esm",
+    "single-file",
+    "lite"
+  ],
+  "author": "Zahary Shinikchiev <shinikchiev@yahoo.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/PeshoVurtoleta/lite-worker-pool.git"
+  },
+  "homepage": "https://github.com/PeshoVurtoleta/lite-worker-pool#readme",
+  "bugs": {
+    "url": "https://github.com/PeshoVurtoleta/lite-worker-pool/issues"
+  },
+  "funding": {
+    "type": "github",
+    "url": "https://github.com/sponsors/PeshoVurtoleta"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "peerDependencies": {
+    "@zakkster/lite-worker": "^1.4.0"
+  },
+  "devDependencies": {
+    "@zakkster/lite-gc-profiler": "^1.11.0",
+    "@zakkster/lite-leak": "^1.8.1"
+  }
+}
