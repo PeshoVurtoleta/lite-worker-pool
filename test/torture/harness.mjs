@@ -16,11 +16,7 @@
 
 import { Worker as NodeWorker } from "node:worker_threads";
 import { fileURLToPath } from "node:url";
-import {
-  createLeakTracker,
-  createOwnerCascadeOrphanKernel,
-  createAsyncRetentionKernel,
-} from "@zakkster/lite-leak";
+import { createLeakTracker } from "@zakkster/lite-leak";
 
 const THREAD_ENTRY = fileURLToPath(import.meta.resolve("./thread-entry.mjs"));
 
@@ -198,19 +194,22 @@ export function settle(ms) {
   return new Promise((r) => setTimeout(r, ms || 50));
 }
 
-// lite-leak tracker. Owner-cascade + async-retention kernels only: the pool
-// patches no global surface here, so patching timers would only add settle noise.
-export function makeTracker() {
-  const leaks = [];
+// Finalization-authority tracker for the T6 retention soak: a PLAIN lite-leak
+// tracker with NO kernels. The owner-cascade / async-retention kernels flag any
+// still-tracked object as suspicious -- but the finalization pattern deliberately
+// HOLDS each disposed pool (no untrack) across the settle so GC can decide its
+// fate, so those kernels would misfire on every held pool. onLeak is likewise
+// omitted: it fires on COLLECTION (a pool that was released), the opposite of a
+// leak. The authority here is tracker.size() read after a hard settle -- a
+// collected pool decrements it, a leaked one does not -- with audit() (no
+// kernels) staying 0 and onWarning counting any pre-FR anomaly.
+export function makeResidualTracker() {
   const warns = [];
   const tracker = createLeakTracker({
     name: "lite-worker-pool-torture",
-    onLeak: (r) => leaks.push(r.kind + ":" + String(r.tag)),
     onWarning: (w) => warns.push(w.kind + ":" + w.reason),
   });
-  tracker.registerKernel(createOwnerCascadeOrphanKernel());
-  tracker.registerKernel(createAsyncRetentionKernel());
-  return { tracker, leaks, warns };
+  return { tracker, warns };
 }
 
 // Held-value contract: the cleanup passed to tracker.track MUST NOT close over

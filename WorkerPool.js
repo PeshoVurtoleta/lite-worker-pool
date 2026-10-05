@@ -1,6 +1,6 @@
 /**
  * @zakkster/lite-worker-pool
- * Zero-GC data-parallel worker pool over @zakkster/lite-worker (v1.0.0).
+ * Zero-GC data-parallel worker pool over @zakkster/lite-worker (v1.0.1).
  *
  * One worker body, bound ONCE, serialized into N workers. `pool.map(items)`
  * saturates every worker with a job queue: each worker pulls the next unassigned
@@ -25,7 +25,7 @@
 import { defineWorker } from "@zakkster/lite-worker";
 
 /** Package version. Kept in three-place sync with package.json and CHANGELOG.md. */
-export const VERSION = "1.0.0";
+export const VERSION = "1.0.1";
 
 // Scratch layout: two Float64 slots per job -- [0] = job index (round-trips so a
 // worker's reply is filed under the right output slot), [1] = the item value in,

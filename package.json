@@ -1,6 +1,6 @@
 {
   "name": "@zakkster/lite-worker-pool",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Zero-GC data-parallel worker pool over @zakkster/lite-worker. Bind one worker body, map an array across every core with an index-ordered result, nothing allocating in the per-item dispatch loop. Zero dependencies, single file.",
   "type": "module",
   "main": "./WorkerPool.js",

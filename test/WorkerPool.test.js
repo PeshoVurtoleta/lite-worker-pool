@@ -43,7 +43,7 @@ function syncSpawn(workerFn) {
 }
 
 test("VERSION is the three-place-synced string", () => {
-  assert.equal(VERSION, "1.0.0");
+  assert.equal(VERSION, "1.0.1");
 });
 
 test("map fills results by index for every item", async () => {

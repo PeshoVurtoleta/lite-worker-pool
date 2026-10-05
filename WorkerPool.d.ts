@@ -3,7 +3,7 @@
  * @copyright Zahary Shinikchiev
  */
 
-/** Package version (1.0.0). Kept in three-place sync with package.json and CHANGELOG.md. */
+/** Package version (1.0.1). Kept in three-place sync with package.json and CHANGELOG.md. */
 export declare const VERSION: string;
 
 /**

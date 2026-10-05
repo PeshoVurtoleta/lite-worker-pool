@@ -5,6 +5,22 @@ All notable changes to `@zakkster/lite-worker-pool` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.1] - 2026-08-31
+
+Test-only maintenance release. Library source (`WorkerPool.js`) is unchanged.
+
+### Changed
+
+- **T6 retention gate** converted from a vacuous track-then-immediate-untrack
+  `tracker.size() === 0` tautology to the finalization-authority pattern: the real
+  pool is tracked with no untrack, references are hard-settled, and the residual
+  live count is asserted `<= RES` (RES = 16).
+
+### Added
+
+- **`TORTURE_BREAK=leak`** control that pins pools to force the retention gate RED
+  (residual ~2048), proving the T6 gate can fail.
+
 ## [1.0.0] - 2026-08-10
 
 Initial release. A zero-GC data-parallel worker pool over `@zakkster/lite-worker`:
@@ -56,4 +72,5 @@ input order, with nothing allocating in the per-item dispatch loop.
 - **Release gate** (`bench/gc-gate.mjs`, `npm run gate`) -- the fast per-item
   retention check.
 
+[1.0.1]: https://github.com/PeshoVurtoleta/lite-worker-pool/releases/tag/v1.0.1
 [1.0.0]: https://github.com/PeshoVurtoleta/lite-worker-pool/releases/tag/v1.0.0

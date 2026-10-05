@@ -32,7 +32,7 @@ Promise per batch (cold, once) -- that is the only per-batch cost.
 
 ## Core API
 
-- `VERSION: string` -- the package version constant (currently `"1.0.0"`), kept in
+- `VERSION: string` -- the package version constant (currently `"1.0.1"`), kept in
   three-place sync with package.json and CHANGELOG.md. Named export from WorkerPool.js.
 - `createWorkerPool(workerFn, opts?) -> Pool` (also the default export)
   - `workerFn(item) -> result` is `.toString()`-serialized into every worker. It

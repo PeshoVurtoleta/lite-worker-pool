@@ -14,17 +14,21 @@
 //   T3 worker-error -- a transform that throws on one item makes map() REJECT
 //      (bounded, no hang) over the real bridge; the item is never silently lost.
 //   T6 retention    -- measureOps over >=10k synchronous dispatch hops shows
-//      < 8 B/op and 0 majors/kOp; scratch byteLength unchanged; lite-leak
-//      tracker.size() === 0 after many pool create/dispose cycles.
+//      < 8 B/op and 0 majors/kOp; scratch byteLength unchanged; and a
+//      FINALIZATION residual (lite-leak tracker.size() read after a HARD settle,
+//      the pools tracked but never untracked) stays <= RES over many pool
+//      create/dispose cycles -- a disposed pool that leaked is not collected.
 //   T9 controls     -- each gate above, deliberately broken, MUST be caught:
 //      (a) a misrouting dispatch drops an output -> conservation fails;
 //      (b) a completion-order collector driven through the real pool -> ordering fails;
 //      (c) a scratch that reallocates per job -> retention fails;
 //      (d) a pool that swallows a worker throw -> map() hangs (bounded wait trips).
 //
-// Proof-of-teardown: set TORTURE_BREAK=conservation|ordering|retention|worker-error
+// Proof-of-teardown: set TORTURE_BREAK=conservation|ordering|retention|worker-error|leak
 // to inject the matching break into the REAL tier so it exits nonzero -- the
-// failing-before half of a failing-before/passing-after control. No output is a FAIL.
+// failing-before half of a failing-before/passing-after control. TORTURE_BREAK=leak
+// pins every disposed pool so it can never finalize -> the T6 residual gate trips.
+// No output is a FAIL.
 
 import { measureOps, checkOps } from "@zakkster/lite-gc-profiler";
 import { createWorkerPool } from "../WorkerPool.js";
@@ -33,13 +37,34 @@ import {
   syncLoopbackSpawn,
   waitFor,
   settle,
-  makeTracker,
+  makeResidualTracker,
   NOOP_CLEANUP,
 } from "./torture/harness.mjs";
 
 const log = (s) => process.stderr.write(s + "\n");
 const BREAK = process.env.TORTURE_BREAK || "";
 const CYCLES = 2048;
+
+// Finalization residual ceiling for the T6 pool-retention gate. A cleanly
+// disposed pool is collected (size--); a leaked one is not. Clean runs leave
+// single digits; a real leak leaves ~CYCLES. Slack matches the di-* authority
+// pattern (max(16, CYCLES/1000)).
+const RES = Math.max(16, (CYCLES / 1000) | 0); // 16
+
+// TORTURE_BREAK=leak pins every disposed pool in this sink so it can NEVER be
+// finalized -> the T6 residual stays ~CYCLES -> the residual gate trips RED.
+const LEAK_HOLD = BREAK === "leak";
+const __leakSink = [];
+
+// Hard settle: drive FinalizationRegistry callbacks to ground (>=10 gc()+tick
+// passes) before reading tracker.size(), or the residual reads an empty window
+// and the gate falsely passes.
+async function settleHard() {
+  for (let i = 0; i < 10; i++) {
+    globalThis.gc?.();
+    await new Promise((r) => setTimeout(r, 15));
+  }
+}
 
 // The per-item transform. Self-contained (no closure) so it serializes into the
 // real worker thread verbatim; exact in Float64 for every index used here.
@@ -230,28 +255,34 @@ async function t6() {
   if (scratchBytes !== 16) throw fail("T6: scratch byteLength drifted to " + scratchBytes + " != 16");
   log("    T6: " + (r.bytesPerOp === null ? "n/a" : r.bytesPerOp.toFixed(2)) + " B/op over " + OPS + " dispatch hops, scratch " + scratchBytes + " B, major=" + r.summary.gc.major);
 
-  // Retention across many pool build/tear-down cycles: a disposed pool must be
-  // collectable. The tag is a constant and the cleanup captures nothing (held-
-  // value contract), so a properly disposed pool is not a leak: size returns to 0.
-  const { tracker, leaks, warns } = makeTracker();
+  // Retention across many pool build/tear-down cycles is proven by FINALIZATION,
+  // not a counter trick. Each cycle tracks the REAL disposed pool with a shared
+  // NOOP cleanup + a numeric tag (neither closes over the pool -- the held-value
+  // contract) and does NOT untrack it: a pool that was truly released is collected
+  // (size--), one that leaked is not. After the loop we settle HARD and assert the
+  // residual tracker.size() <= RES.
+  //
+  // (The earlier track-then-immediate-untrack asserted size()===0 -- a VACUOUS
+  // TAUTOLOGY: untrack decrements the live counter synchronously, netting to 0
+  // every cycle even if the pool were retained forever. A retention gate must
+  // FAIL on a retained object; TORTURE_BREAK=leak proves this one does.)
+  const { tracker, warns } = makeResidualTracker();
   for (let i = 0; i < CYCLES; i++) {
     const d = syncLoopbackSpawn(f, {});
     const p = createWorkerPool(f, { size: 2, spawn: d.factory });
     p.dispose();
-    const rec = tracker.track(p, NOOP_CLEANUP, "pool");
-    tracker.untrack(rec);
+    tracker.track(p, NOOP_CLEANUP, i);
+    if (LEAK_HOLD) __leakSink.push(p); // pin -> can NEVER finalize -> residual ~CYCLES
   }
-  await settle();
-  await settle();
+  await settleHard();
   const live = tracker.size();
   const findings = tracker.audit();
   metrics.leakSize = live;
   metrics.findings = findings.length;
   metrics.warnings = warns.length;
-  if (live !== 0) throw fail("T6: " + live + " pools still tracked after " + CYCLES + " cycles");
+  if (live > RES) throw fail("T6: finalization residual size()=" + live + " > " + RES + " -- a disposed pool outlived its dispose()");
   if (findings.length !== 0) throw fail("T6: " + findings.length + " leak findings");
-  if (leaks.length !== 0) throw fail("T6: " + leaks.length + " leaks: " + leaks.join(", "));
-  log("    T6: " + CYCLES + " create/dispose cycles, tracker size=0, findings=0");
+  log("    T6: " + CYCLES + " create/dispose cycles, residual size=" + live + "/" + RES + ", findings=0");
 }
 
 // ---------------------------------------------------------------------------
@@ -360,7 +391,7 @@ for (const tier of TIERS) {
 }
 
 log(
-  "GATE leak=size " + metrics.leakSize + "/0 findings=" + metrics.findings +
+  "GATE leak=size " + metrics.leakSize + "/" + RES + " findings=" + metrics.findings +
   " warnings=" + metrics.warnings +
   " | gc major=" + metrics.gcMajor + " minor=" + metrics.gcMinor +
   " maxMs=" + metrics.gcMaxMs.toFixed(2) +
