@@ -8,7 +8,9 @@
 > them behind a single `map(items) -> Promise<results>` call. v1.0.0 is the
 > initial release: index-ordered map, a saturating job queue, and a per-worker
 > transferable scratch buffer ping-ponged in/out so steady-state dispatch is
-> allocation-free.
+> allocation-free. v1.1.0 adds `createWorkerSet`, a SERVICE mode: the caller (a load
+> balancer such as @zakkster/lite-pick) chooses the worker per job, with per-worker
+> slots + a capped FIFO queue, failure isolation, respawn, and 0-alloc health probes.
 
 ## Mental model
 
@@ -32,7 +34,7 @@ Promise per batch (cold, once) -- that is the only per-batch cost.
 
 ## Core API
 
-- `VERSION: string` -- the package version constant (currently `"1.0.1"`), kept in
+- `VERSION: string` -- the package version constant (currently `"1.1.0"`), kept in
   three-place sync with package.json and CHANGELOG.md. Named export from WorkerPool.js.
 - `createWorkerPool(workerFn, opts?) -> Pool` (also the default export)
   - `workerFn(item) -> result` is `.toString()`-serialized into every worker. It
@@ -118,3 +120,42 @@ at its worker when the queue drains, so the buffer count is conserved at exactly
 - bench/gc-gate.mjs -- fast release retention gate via @zakkster/lite-gc-profiler. `npm run gate`.
 
 License: MIT (c) Zahary Shinikchiev
+
+## Service mode: createWorkerSet (1.1.0)
+
+- `createWorkerSet(workerFn, opts?) -> WorkerSet`. `workerFn(item, ctl) -> number` is serialized once into every
+  worker (self-contained, like map's); `ctl` is that worker's control values (an empty Float64Array until set).
+  `opts`: `size?` (as createWorkerPool), `slots?` = jobs in flight per worker, integer [1, 8], default 2;
+  `queue?` = queued jobs per worker beyond the slots, integer [0, 65536], default 32 (never unbounded);
+  `name?`; `spawn?` = set-mode transport factory, `(spec) => { send, onRaw, onError, onPost, post, terminate }`
+  where `spec` is `{ workerFn, index, name, scratchBytes: 24, mode: 'set' }`; `onSettle?(i, tag, ok, value, code)`
+  for post(); `now?` (busySince clock, default performance.now). Unknown keys throw LWP_OPTION (did-you-mean).
+- `WORKER_STATE` = `{ STARTING: 0, READY: 1, DOWN: 2 }` (frozen). Work is accepted only while READY; a worker is
+  STARTING until its READY handshake.
+- `submit(i, value, { signal }?) -> Promise<number>` -- run `value` on worker i. Rejects with a coded Error:
+  LWP_INDEX, LWP_ARGUMENT, LWP_OPTION, LWP_NOT_READY, LWP_WORKER_DOWN, LWP_QUEUE_FULL (slots and queue full --
+  immediate, so a balancer can fail over), LWP_TRANSFORM (the transform threw; carries its message),
+  LWP_ABORTED, LWP_DISPOSED. Abort: a QUEUED job is removed and rejects with the signal's reason (never runs);
+  an EXECUTING job rejects at once with LWP_ABORTED (cause = reason), its late result is discarded, its slot
+  frees on the worker's reply.
+- `post(i, value, tag) -> boolean` -- zero-allocation dispatch (0.00 B/op in this package's code, measured);
+  completion via onSettle. false = not accepted (disposed, not READY, queue full). Throws LWP_INDEX /
+  LWP_ARGUMENT (tag must be a number).
+- Per-worker FIFO: jobs to one worker settle in submission order. A reply out of order takes the worker DOWN
+  (fail closed; a result is never misfiled).
+- Isolation: a transform throw fails ONE job, the worker stays READY; a worker death (error / unexpected exit)
+  or `kill(i)` fails only worker i's in-flight and queued jobs (LWP_WORKER_DOWN); nothing poisons the set.
+- `respawn(i) -> Promise<void>` -- a fresh worker in slot i (a live one is killed first), READY after its
+  handshake; control values re-applied. `kill(i)` -- terminate now, idempotent. `ready() -> Promise<void>` --
+  every worker READY (rejects if one goes DOWN first).
+- 0-alloc reads that never throw (health probes, a balancer's load view): `isReady(i)`, `load(i)` (executing +
+  queued), `busySince(i)` (now() when the oldest in-flight job was sent; NaN when idle -- a hung job shows here).
+  `state(i)` (throws LWP_INDEX on a bad index).
+- `control(i, values: Float64Array)` -- copy values to worker i (its transform's `ctl`). `stats()` -- cold
+  snapshot `{ size, slots, queue, workers: [{ state, executing, queued, done, failed }] }`. `dispose()` --
+  idempotent; every pending job fails LWP_DISPOSED (post jobs through onSettle).
+- Measured (Node 26.8, 12 cores, 4 worker_threads): 1 job in flight per worker 207k jobs/s, 2 in flight 397k
+  (empty transform); ~0.1 ms of work: 34k -> 39k. Node's MessagePort itself allocates ~1.06 KB/job (Node 26) /
+  ~1.44 KB/job (Node 22) on the main thread -- the transport's, for map() too; disclosed, not gated.
+- Composes with @zakkster/lite-pick: `pool.run((i, signal) => set.submit(i, job, { signal }), { tries })` --
+  lite-pick selects, the set executes; neither imports the other. Design + prior art: research/worker-set.md.

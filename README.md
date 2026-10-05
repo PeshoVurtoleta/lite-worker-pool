@@ -59,6 +59,7 @@ One transform, one `map`, N cores, zero allocation on the per-item dispatch path
 - [Why this exists](#why-this-exists)
 - [What you get](#what-you-get)
 - [How map, the queue, and the scratch fit together](#how-map-the-queue-and-the-scratch-fit-together)
+- [Service mode: `createWorkerSet` (1.1.0)](#service-mode-createworkerset-110)
 - [API reference](#api-reference)
   - [The factory](#the-factory)
   - [The pool](#the-pool)
@@ -119,6 +120,78 @@ Full types ship in [`WorkerPool.d.ts`](./WorkerPool.d.ts). Every export is docum
 **Why the hot path is allocation-free.** The dispatch loop reuses a single one-element transfer list across every `send`, and reuses each worker's scratch buffer for the life of the pool. The only per-hop cost is one transient `Float64Array` view header rebuilt over the returned buffer (a transfer mints a fresh `ArrayBuffer` identity each hop, so the view cannot be cached) -- transient, GC'd, never retained. `map()` itself allocates the results array plus one Promise per batch; that is cold, once per batch, not per item.
 
 </details>
+
+---
+
+## Service mode: `createWorkerSet` (1.1.0)
+
+`map()` is a batch: workers pull the next item themselves, and one failure rejects the batch. A **service** needs
+the opposite: the CALLER chooses the worker for each job (a load balancer such as
+[`@zakkster/lite-pick`](https://www.npmjs.com/package/@zakkster/lite-pick), a key hash, any policy), a few jobs queue
+behind a busy worker, and one dead worker must not take the others down. `createWorkerSet` is that mode. It is a
+separate object -- the two never share a queue (a shared work-stealing queue and targeted dispatch exclude each
+other; Akka's `BalancingPool` and `ConsistentHashingPool` make the same split).
+
+```js
+import { createWorkerSet } from '@zakkster/lite-worker-pool';
+
+// ctl = this worker's control values (set.control), an empty Float64Array until set
+const set = createWorkerSet((item, ctl) => heavyWork(item, ctl), { size: 8, slots: 2, queue: 32 });
+await set.ready();                                   // every worker has said READY
+
+const result = await set.submit(3, 42);              // run 42 on worker 3
+```
+
+With lite-pick choosing the worker (lite-pick selects, the set executes; neither imports the other):
+
+```js
+import { P2cBalancer } from '@zakkster/lite-pick';
+import { Pool } from '@zakkster/lite-pick/pool';
+
+const inflight = new Uint32Array(8);
+const pool = new Pool(new P2cBalancer(8, eligible, inflight), inflight);
+const out = await pool.run((i, signal) => set.submit(i, job, { signal }), { tries: 2 });
+// a full queue or a dead worker rejects the attempt -> /pool fails over to a different worker
+```
+
+What it guarantees:
+
+- **Per-worker FIFO.** Jobs sent to the same worker settle in the order they were submitted -- so routing a key
+  to one worker gives per-key ordering. A reply out of order is a protocol violation: the worker goes DOWN, a
+  result is never misfiled.
+- **Two jobs in flight per worker by default (`slots`, 1-8), a capped queue behind them (`queue`, default 32).**
+  Measured, 4 `worker_threads` workers: one job in flight 207k jobs/s, two 397k (empty transform); with ~0.1 ms
+  of work 34k -> 39k. A full queue rejects at once with `LWP_QUEUE_FULL` -- never an unbounded queue.
+- **Failure isolation.** A transform throw fails only that job (`LWP_TRANSFORM`, with the message); the worker
+  stays READY. A worker death or `kill(i)` fails only that worker's jobs (`LWP_WORKER_DOWN`). `respawn(i)` puts a
+  fresh worker in the same slot (stable index, so a key's mapping stays valid) and re-applies its control values.
+- **READY handshake.** A worker is STARTING until its first message; it accepts no work before that.
+- **Probes for health checks, 0-alloc:** `isReady(i)`, `load(i)` (executing + queued), `busySince(i)` (the send
+  time of the oldest job in flight -- a job stuck in the thread shows up here; `kill` + `respawn` recover).
+- **Abort.** A queued job is removed and rejects with the signal's reason (it never runs). A job already
+  executing cannot be interrupted inside the thread: it rejects at once with `LWP_ABORTED`, its late result is
+  discarded, and its slot frees when the worker replies.
+- **Two completion paths.** `submit()` returns a Promise (one per job, like any async API). `post(i, value, tag)`
+  plus the `onSettle(i, tag, ok, value, code)` option allocates nothing in this package's code per job -- measured
+  `0.00 B/op` over the loopback (torture TS5).
+- **Codes, not messages:** every error carries `code` -- `LWP_INDEX`, `LWP_ARGUMENT`, `LWP_OPTION`,
+  `LWP_TRANSPORT`, `LWP_NOT_READY`, `LWP_WORKER_DOWN`, `LWP_QUEUE_FULL`, `LWP_TRANSFORM`, `LWP_ABORTED`,
+  `LWP_DISPOSED`.
+
+| Method | |
+|---|---|
+| `submit(i, value, { signal }?) -> Promise<number>` | run on worker `i` |
+| `post(i, value, tag) -> boolean` | zero-alloc dispatch; completion via `onSettle` |
+| `state(i)`, `isReady(i)`, `load(i)`, `busySince(i)` | `WORKER_STATE.STARTING / READY / DOWN`; 0-alloc reads |
+| `ready()`, `kill(i)`, `respawn(i)`, `control(i, Float64Array)` | lifecycle |
+| `stats()`, `dispose()` | cold snapshot; teardown (every pending job fails `LWP_DISPOSED`) |
+
+A custom transport (`opts.spawn`) for set mode is the map-mode surface plus `onPost(fn(type, data)) -> off` (the
+worker's READY and transform-error messages) and `post(type, data)` (control values); see
+`test/torture/harness.mjs` `realThreadSetSpawn` for a `node:worker_threads` one.
+
+The design, the measurements and the prior art (Akka/Pekko, Orleans, Piscina, poolifier, HAProxy, Join-Idle-Queue)
+are in [`research/worker-set.md`](./research/worker-set.md).
 
 ---
 
@@ -240,6 +313,14 @@ One `createWorkerPool` allocates everything it will ever need at construction: N
 | `stats()`                        | 1 small snapshot object per call (cold) |
 | `createWorkerPool`               | once, at construction (all scratch + workers, then reused) |
 
+**What the transport itself costs (outside this package's code).** Node's `MessagePort` allocates on the main
+thread for every message received -- the message event and the deserialized buffer object. Measured with
+`--trace-gc` at a pinned 1 MB semi-space, 400k jobs: **~1.06 KB/job on Node 26.8, ~1.44 KB/job on Node 22.23**
+(plus ~0.13 KB for the view over the returned buffer). It is transient (collected by minor GCs, never retained)
+and it applies to `map()` and `createWorkerSet` alike; the gates above measure this package's own dispatch path
+over an in-process loopback, where it does not appear. Removing it would take a SharedArrayBuffer ring (Node
+always; browsers only when cross-origin isolated) -- not shipped.
+
 The transient per-hop view header is the ring's only per-hop cost -- the same one lite-worker's frame pool pays, because a transfer mints a fresh `ArrayBuffer` identity each hop, so the view cannot be cached across the boundary. It is transient garbage, not retained.
 
 The **hard, gated claim is RETENTION**: the torture harness (`@zakkster/lite-leak` + `@zakkster/lite-gc-profiler`) proves the per-item dispatch path holds **`< 8 B/op`** -- in practice `0.00 B/op` -- with **0 major GCs** over 10k dispatch hops, the scratch `byteLength` unchanged across the whole run, and `@zakkster/lite-leak`'s `tracker.size() === 0` after 2048 pool create/dispose cycles. No gate output is a FAIL; the retention gate runs on every change.
@@ -267,11 +348,12 @@ Wall-clock scales with core count for CPU-bound transforms: the queue keeps ever
 
 ## Testing
 
-**13 deterministic `node:test` cases, all pass**, plus a torture gate that proves conservation, ordering, saturation, fail-closed errors, and zero retention over a real thread bridge.
+**45 deterministic `node:test` cases (32 for `map`, 13 for `createWorkerSet`), all pass**, plus torture gates that proves conservation, ordering, saturation, fail-closed errors, and zero retention over a real thread bridge.
 
 ```bash
-npm test          # 13 node:test cases (contract + boundary + fail-closed surface)
+npm test          # 45 node:test cases (contract + boundary + fail-closed surface)
 npm run torture   # @zakkster/lite-leak + lite-gc-profiler: real-thread conservation + 0 B/op
+npm run torture:set  # createWorkerSet over real threads: conservation, isolation, FIFO, respawn, 0 B/op
 npm run gate      # the fast per-item retention gate
 npm run check     # node --check + tsc --strict on the .d.ts
 npm run soak      # the torture suite (extended)
@@ -288,15 +370,25 @@ The torture suite (`test/torture.mjs`) runs every tier over a REAL `node:worker_
 
 A normal `node --expose-gc test/torture.mjs` prints exactly `ok` and exits 0. No gate output is a FAIL.
 
+The set-mode suite (`test/torture-set.mjs`) runs over real `node:worker_threads` too:
+
+- **TS0 conservation** -- 40000 jobs over 8 threads, worker 3 killed mid-stream and respawned: every job settles exactly once, every job on another worker returns the right result, the killed worker's jobs fail only with `LWP_WORKER_DOWN`, per-worker order holds, and the respawned worker serves again.
+- **TS1 transform throw** -- a throwing item fails only itself; every worker stays READY.
+- **TS2 crash + respawn** -- a thread that exits takes only its worker down; then 50 kill/respawn cycles.
+- **TS3 hung worker** -- a job stuck in the thread shows up in `busySince`; `kill` + `respawn` recover.
+- **TS4 control values** -- reach only their worker and survive respawn.
+- **TS5 retention** -- the `post`/`onSettle` hop at `0.00 B/op` (measureOps), 1000 respawns, and 1024 create/dispose cycles with a finalization residual `<= 16`.
+- **TS9 controls** -- a dropped reply and out-of-order replies both fail TS0; `TORTURE_BREAK=set-drop|set-reorder|set-leak` breaks the real tier (each exits non-zero).
+
 ---
 
 ## What this is not
 
 - **Not a replacement for `@zakkster/lite-worker`.** The core is one persistent off-thread loop with a clean main thread (frameChannel, adoptCanvas, RPC). The pool is a batch fanned across cores. The pool depends on the core; the core never depends on the pool. Use the core for a long-lived single worker.
-- **Not a general RPC or actor system.** There is no `call`, no message protocol, no per-worker state, no bidirectional streaming. One transform, applied to items, results back. For request/response to a single worker, use the core's `call`/`post`/`on`.
+- **Not a general RPC or actor system.** There is no `call`, no general message protocol, no bidirectional streaming. One transform, applied to numbers, results back (`createWorkerSet` adds per-worker control values, not RPC). For request/response to a single worker, use the core's `call`/`post`/`on`.
 - **Not for non-numeric payloads out of the box.** The zero-copy scratch protocol moves `Float64` values. Items and results are numbers; extend the protocol yourself for structured payloads.
 - **Not a SharedArrayBuffer pool.** It uses transfer semantics only -- no cross-origin isolation, no COOP/COEP required. (The core's frameChannel has an opt-in shared mode; the pool does not.)
-- **Not a task scheduler.** No priorities, no cancellation of individual items, no retry policy, no backpressure knobs. One batch at a time, run to completion or reject.
+- **Not a task scheduler.** No priorities and no retry policy. `map()` runs one batch at a time, to completion or reject; `createWorkerSet` adds per-job abort and a capped queue, but choosing the worker is the caller's job (or a load balancer's) -- the set never steals work between workers, which would break per-key placement.
 - **Not a GUI or a benchmark harness.** Bring your own workload and your own measurement; the pool is the fan-out kernel underneath.
 
 ---

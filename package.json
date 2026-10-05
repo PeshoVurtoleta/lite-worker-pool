@@ -1,6 +1,6 @@
 {
   "name": "@zakkster/lite-worker-pool",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "Zero-GC data-parallel worker pool over @zakkster/lite-worker. Bind one worker body, map an array across every core with an index-ordered result, nothing allocating in the per-item dispatch loop. Zero dependencies, single file.",
   "type": "module",
   "main": "./WorkerPool.js",
@@ -23,10 +23,11 @@
   ],
   "sideEffects": false,
   "scripts": {
-    "test": "node --test test/WorkerPool.test.js",
+    "test": "node --test test/WorkerPool.test.js test/WorkerSet.test.js",
     "check": "node --check WorkerPool.js && tsc --noEmit --strict WorkerPool.d.ts",
     "gate": "node --expose-gc bench/gc-gate.mjs",
     "torture": "node --expose-gc test/torture.mjs",
+    "torture:set": "node --expose-gc test/torture-set.mjs",
     "soak": "node --expose-gc test/torture.mjs"
   },
   "keywords": [

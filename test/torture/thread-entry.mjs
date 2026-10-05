@@ -12,9 +12,16 @@
 import { parentPort, workerData } from "node:worker_threads";
 
 const handlers = new Set();
+const typed = new Map();   // set mode (1.1.0): typed messages in, e.g. "lwp:ctl" control values
 
 const ctx = {
   onRaw(fn) { handlers.add(fn); return () => handlers.delete(fn); },
+  on(type, fn) {
+    let set = typed.get(type);
+    if (!set) { set = new Set(); typed.set(type, set); }
+    set.add(fn);
+    return () => set.delete(fn);
+  },
   send(buf, transfer) {
     const ab = buf instanceof ArrayBuffer ? buf : (ArrayBuffer.isView(buf) ? buf.buffer : null);
     parentPort.postMessage(buf, transfer || (ab ? [ab] : []));
@@ -25,7 +32,11 @@ const ctx = {
   post(type, data) { parentPort.postMessage({ t: type, d: data === undefined ? null : data }); },
 };
 
-parentPort.on("message", (buf) => { handlers.forEach((fn) => fn(buf)); });
+parentPort.on("message", (msg) => {
+  if (msg instanceof ArrayBuffer || ArrayBuffer.isView(msg)) { handlers.forEach((fn) => fn(msg)); return; }
+  const set = msg && typed.get(msg.t);
+  if (set) set.forEach((fn) => fn(msg.d));
+});
 
 // eslint-disable-next-line no-new-func
 new Function("ctx", workerData.body)(ctx);

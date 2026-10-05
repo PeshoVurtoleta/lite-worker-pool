@@ -1,6 +1,7 @@
 # Research: a service-shaped mode for lite-worker-pool -- `createWorkerSet`
 
-**Status:** PROPOSED 2026-10-05 -- decisions E1-E11 below need your call. Nothing is built yet.
+**Status:** DECIDED 2026-10-05 (all recommendations accepted, E1-E11) and IMPLEMENTED 2026-10-05 in 1.1.0:
+`createWorkerSet` in `WorkerPool.js`, `test/WorkerSet.test.js`, `test/torture-set.mjs` (`npm run torture:set`).
 **Why now:** the lite-pick capstone (LitePick `research/capstone-pickEcosystem.md`, decided 2026-10-05, C3) needs a
 worker layer where a load balancer CHOOSES the worker. lite-pick's ADR 0001 said this is the one place lite-pick
 adds value next to this package: keyed, push and heterogeneous dispatch. It is P0 of the capstone.

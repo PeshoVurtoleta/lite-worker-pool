@@ -215,3 +215,120 @@ export function makeResidualTracker() {
 // Held-value contract: the cleanup passed to tracker.track MUST NOT close over
 // the tracked target, or finalization is defeated. A shared no-op captures nothing.
 export const NOOP_CLEANUP = function () {};
+
+// ---------------------------------------------------------------------------
+// Set mode (1.1.0): transports for createWorkerSet. A set-mode transport adds
+// onPost(fn(type, data)) -- READY and transform-error messages in -- and
+// post(type, data) -- control values out -- to the map-mode surface.
+// ---------------------------------------------------------------------------
+
+// The set-mode worker body (mirrors WorkerPool.js buildSetModule), with optional
+// faults so a control can prove a gate is not decorative:
+//   "crash"   -- the thread exits (process.exit) when the item equals `at`.
+//   "hang"    -- busy-loops `ms` milliseconds when the item equals `at`.
+//   "reorder" -- holds every EVEN job id's reply until the next job's reply has been
+//                sent (replies leave out of order; the set must fail closed).
+//   "drop"    -- never replies to the item equal to `at` (a lost job).
+export function buildSetBody(workerFn, opts) {
+  const o = opts || {};
+  const fault = o.fault || "";
+  const at = Number(o.at === undefined ? NaN : o.at);
+  return (
+    "var __fn = (" + workerFn.toString() + ");\n" +
+    "var __ctl = new Float64Array(0);\n" +
+    "var __held = null;\n" +
+    "ctx.on('lwp:ctl', function (d) { __ctl = d instanceof Float64Array ? d : new Float64Array(0); });\n" +
+    "ctx.onRaw(function (buf) {\n" +
+    "  var f = new Float64Array(buf);\n" +
+    (fault === "crash" ? "  if (f[1] === " + at + ") process.exit(3);\n" : "") +
+    (fault === "hang" ? "  if (f[1] === " + at + ") { var t0 = Date.now(); while (Date.now() - t0 < " + (o.ms | 0) + ") {} }\n" : "") +
+    (fault === "drop" ? "  if (f[1] === " + at + ") return;\n" : "") +
+    "  try { f[1] = __fn(f[1], __ctl); f[2] = 0; }\n" +
+    "  catch (e) { f[2] = 1; ctx.post('lwp:terr', { message: (e && e.message) || String(e) }); }\n" +
+    (fault === "reorder"
+      ? "  if (__held === null && (f[0] % 2) === 0) { __held = buf; return; }\n" +
+        "  ctx.send(buf);\n  if (__held !== null && __held !== buf) { var h = __held; __held = null; ctx.send(h); }\n"
+      : "  ctx.send(buf);\n") +
+    "});\n" +
+    "ctx.post('lwp:ready', null);\n"
+  );
+}
+
+// Each set worker on a real OS thread. An unexpected thread exit is a death
+// (onError); a terminate() we asked for is not.
+export function realThreadSetSpawn(workerFn, opts) {
+  const body = buildSetBody(workerFn, opts);
+  const workers = [];
+  const factory = function () {
+    const worker = new NodeWorker(THREAD_ENTRY, { workerData: { body } });
+    workers.push(worker);
+    const raw = new Set();
+    const errs = new Set();
+    const posts = new Set();
+    let terminating = false;
+    const emitErr = (e) => errs.forEach((fn) => fn(e));
+    worker.on("error", (e) => emitErr(e instanceof Error ? e : new Error(String(e))));
+    worker.on("exit", (code) => { if (!terminating) emitErr(new Error("worker thread exited with code " + code)); });
+    worker.on("message", (msg) => {
+      if (msg instanceof ArrayBuffer || ArrayBuffer.isView(msg)) { raw.forEach((fn) => fn(msg)); return; }
+      if (msg && typeof msg.t === "string") posts.forEach((fn) => fn(msg.t, msg.d));
+    });
+    return {
+      send(buf, transfer) { worker.postMessage(buf, transfer || [buf]); },
+      onRaw(fn) { raw.add(fn); return () => raw.delete(fn); },
+      onError(fn) { errs.add(fn); return () => errs.delete(fn); },
+      onPost(fn) { posts.add(fn); return () => posts.delete(fn); },
+      post(type, data) { worker.postMessage({ t: type, d: data }); },
+      terminate() { terminating = true; worker.terminate(); },
+    };
+  };
+  factory.workers = workers;
+  return factory;
+}
+
+// A synchronous, step-driven set-mode loopback. Jobs run only when the caller pumps
+// driver.step() (one job) or driver.drain(); READY is delivered on a microtask after
+// the transport is built (so the set has wired onPost). driver.die(index) makes that
+// worker's transport report a death. `reorder: true` swaps the first two pending
+// replies of a worker (the set must fail closed); `drop: value` never replies to it.
+export function setLoopbackSpawn(workerFn, opts) {
+  const o = opts || {};
+  const driver = { queue: [], transports: [], lastBuf: null };
+  const factory = function (spec) {
+    const raw = new Set();
+    const errs = new Set();
+    const posts = new Set();
+    const tr = { index: spec.index, ctl: new Float64Array(0), dead: false, raw, errs, posts };
+    driver.transports[spec.index] = tr;
+    queueMicrotask(() => { if (!tr.dead) posts.forEach((fn) => fn("lwp:ready", null)); });
+    return {
+      send(buf) { driver.queue.push({ buf, tr }); },
+      onRaw(fn) { raw.add(fn); return () => raw.delete(fn); },
+      onError(fn) { errs.add(fn); return () => errs.delete(fn); },
+      onPost(fn) { posts.add(fn); return () => posts.delete(fn); },
+      post(type, data) { if (type === "lwp:ctl") tr.ctl = new Float64Array(data); },
+      terminate() { tr.dead = true; raw.clear(); errs.clear(); posts.clear(); },
+    };
+  };
+  driver.step = function () {
+    let k = 0;
+    if (o.reorder && driver.queue.length >= 2 && driver.queue[0].tr === driver.queue[1].tr) k = 1;
+    const job = driver.queue.splice(k, 1)[0];
+    if (!job) return false;
+    if (job.tr.dead) return true;
+    const f = new Float64Array(job.buf);
+    if (o.drop !== undefined && f[1] === o.drop) return true;
+    try { f[1] = workerFn(f[1], job.tr.ctl); f[2] = 0; }
+    catch (e) { f[2] = 1; job.tr.posts.forEach((fn) => fn("lwp:terr", { message: (e && e.message) || String(e) })); }
+    driver.lastBuf = job.buf;
+    job.tr.raw.forEach((fn) => fn(job.buf));
+    return true;
+  };
+  driver.drain = function () { let n = 0; while (driver.step()) n++; return n; };
+  driver.die = function (index) {
+    const tr = driver.transports[index];
+    tr.errs.forEach((fn) => fn(new Error("loopback worker " + index + " died")));
+  };
+  driver.factory = factory;
+  return driver;
+}
